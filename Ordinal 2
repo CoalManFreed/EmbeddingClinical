@@ -1,0 +1,1083 @@
+!pip -q install wfdb statsmodels
+
+import os, json, math, random, copy, warnings, itertools
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import wfdb
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    precision_recall_fscore_support,
+    confusion_matrix,
+    f1_score,
+    cohen_kappa_score,
+    roc_curve,
+    precision_recall_curve,
+    auc,
+    roc_auc_score
+)
+from sklearn.preprocessing import label_binarize
+from sklearn.calibration import calibration_curve
+
+from statsmodels.stats.contingency_tables import mcnemar
+
+SEEDS = [21, 22, 23]
+PRIMARY_SEED = SEEDS[0]
+
+BATCH_SIZE = 256
+EPOCHS = 25
+EXPECTED_LEN = 1000
+N_BOOT = 1000
+
+SELECT_LEADS = ["I", "aVF"]
+DISPLAY_LEAD_NAMES = ["I", "aVF"]
+
+OUT_ROOT = "/kaggle/working/axis_manuscript_outputs_ordinal_2lead"
+MAIN_DIR = os.path.join(OUT_ROOT, "main_manuscript")
+SUPP_DIR = os.path.join(OUT_ROOT, "supplement")
+FIG_DIR  = os.path.join(MAIN_DIR, "figures")
+TAB_DIR  = os.path.join(MAIN_DIR, "tables")
+SUPP_FIG_DIR = os.path.join(SUPP_DIR, "figures")
+SUPP_TAB_DIR = os.path.join(SUPP_DIR, "tables")
+
+for d in [OUT_ROOT, MAIN_DIR, SUPP_DIR, FIG_DIR, TAB_DIR, SUPP_FIG_DIR, SUPP_TAB_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+
+BASE = "/kaggle/input/datasets/khyeh0719/ptb-xl-dataset"
+PTBXL_ROOT = os.path.join(
+    BASE, "ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.1"
+)
+DB_CSV = os.path.join(PTBXL_ROOT, "ptbxl_database.csv")
+
+
+ORDERED_CLASSES = ["ALAD", "LAD", "MID", "RAD", "ARAD"]
+class_to_idx = {c: i for i, c in enumerate(ORDERED_CLASSES)}
+idx_to_class = {i: c for c, i in class_to_idx.items()}
+num_classes = len(ORDERED_CLASSES)
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+
+df = pd.read_csv(DB_CSV)
+
+df = df[df["heart_axis"].notna()].copy()
+df = df[df["filename_lr"].notna()].copy()
+df = df[~df["heart_axis"].isin(["AXR", "AXL", "SAG"])].copy()
+df = df[df["heart_axis"].isin(ORDERED_CLASSES)].copy()
+
+df["record_path"] = df["filename_lr"].apply(lambda x: os.path.join(PTBXL_ROOT, x))
+df = df[df["record_path"].apply(lambda x: os.path.exists(x + ".hea"))].copy()
+
+df["y"] = df["heart_axis"].map(class_to_idx).astype(int)
+
+print("Remaining rows:", len(df))
+print(df["heart_axis"].value_counts().reindex(ORDERED_CLASSES, fill_value=0))
+
+
+train_df, test_df = train_test_split(
+    df, test_size=0.15, stratify=df["y"], random_state=PRIMARY_SEED
+)
+train_df, val_df = train_test_split(
+    train_df, test_size=0.1765, stratify=train_df["y"], random_state=PRIMARY_SEED
+)
+
+print(f"Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
+
+
+class PTBXLDataset(Dataset):
+    def __init__(self, frame, expected_len=1000, select_leads=None):
+        self.frame = frame.reset_index(drop=True)
+        self.expected_len = expected_len
+        self.select_leads = select_leads
+
+    def __len__(self):
+        return len(self.frame)
+
+    def __getitem__(self, idx):
+        row = self.frame.iloc[idx]
+
+        sig, fields = wfdb.rdsamp(row["record_path"])
+        sig = sig.astype(np.float32)  # (T, C)
+
+        if self.select_leads is not None:
+            sig_names = list(fields["sig_name"])
+            sig_names_norm = [s.strip().upper() for s in sig_names]
+            req = [l.strip().upper() for l in self.select_leads]
+
+            missing = [l for l in req if l not in sig_names_norm]
+            if missing:
+                raise ValueError(f"Lead(s) {missing} not found. Available leads: {sig_names}")
+
+            lead_idx = [sig_names_norm.index(l) for l in req]
+            sig = sig[:, lead_idx]
+
+        sig = sig.T  # (2, T)
+
+        if sig.shape[1] > self.expected_len:
+            sig = sig[:, :self.expected_len]
+        elif sig.shape[1] < self.expected_len:
+            pad = self.expected_len - sig.shape[1]
+            sig = np.pad(sig, ((0, 0), (0, pad)))
+
+        mu = sig.mean(axis=1, keepdims=True)
+        sd = sig.std(axis=1, keepdims=True) + 1e-6
+        sig = (sig - mu) / sd
+
+        return (
+            torch.tensor(sig, dtype=torch.float32),
+            torch.tensor(int(row["y"]), dtype=torch.long)
+        )
+
+def load_and_normalize_signal(record_path, expected_len=1000, select_leads=None):
+    sig, fields = wfdb.rdsamp(record_path)
+    sig = sig.astype(np.float32)
+
+    if select_leads is not None:
+        sig_names = list(fields["sig_name"])
+        sig_names_norm = [s.strip().upper() for s in sig_names]
+        req = [l.strip().upper() for l in select_leads]
+
+        missing = [l for l in req if l not in sig_names_norm]
+        if missing:
+            raise ValueError(f"Lead(s) {missing} not found. Available leads: {sig_names}")
+
+        lead_idx = [sig_names_norm.index(l) for l in req]
+        sig = sig[:, lead_idx]
+
+    sig = sig.T
+
+    if sig.shape[1] > expected_len:
+        sig = sig[:, :expected_len]
+    elif sig.shape[1] < expected_len:
+        pad = expected_len - sig.shape[1]
+        sig = np.pad(sig, ((0, 0), (0, pad)))
+
+    mu = sig.mean(axis=1, keepdims=True)
+    sd = sig.std(axis=1, keepdims=True) + 1e-6
+    sig = (sig - mu) / sd
+    return sig
+
+def ordinal_encode(y, num_classes):
+    y = y.view(-1)
+    out = torch.zeros((y.size(0), num_classes - 1), device=y.device, dtype=torch.float32)
+    for k in range(num_classes - 1):
+        out[:, k] = (y > k).float()
+    return out
+
+def enforce_monotonic_threshold_probs_np(threshold_probs):
+    return np.minimum.accumulate(threshold_probs, axis=1)
+
+def ordinal_threshold_probs_to_class_probs_np(threshold_probs):
+    q = enforce_monotonic_threshold_probs_np(threshold_probs.copy())
+    n = q.shape[0]
+    k_minus_1 = q.shape[1]
+    k = k_minus_1 + 1
+
+    class_probs = np.zeros((n, k), dtype=np.float32)
+    class_probs[:, 0] = 1.0 - q[:, 0]
+    for c in range(1, k - 1):
+        class_probs[:, c] = q[:, c - 1] - q[:, c]
+    class_probs[:, k - 1] = q[:, k - 2]
+
+    class_probs = np.clip(class_probs, 0.0, 1.0)
+    row_sums = class_probs.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    class_probs = class_probs / row_sums
+    return class_probs
+
+def ordinal_logits_to_preds_and_probs(logits, threshold=0.5):
+    threshold_probs = torch.sigmoid(logits)
+    preds = torch.sum(threshold_probs > threshold, dim=1)
+    threshold_probs_np = threshold_probs.detach().cpu().numpy()
+    class_probs_np = ordinal_threshold_probs_to_class_probs_np(threshold_probs_np)
+    return preds, threshold_probs_np, class_probs_np
+
+class BasicBlock(nn.Module):
+    def __init__(self, in_c, out_c, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_c, out_c, 7, stride, 3, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_c)
+        self.conv2 = nn.Conv1d(out_c, out_c, 7, 1, 3, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_c)
+
+        self.down = None
+        if stride != 1 or in_c != out_c:
+            self.down = nn.Sequential(
+                nn.Conv1d(in_c, out_c, 1, stride, bias=False),
+                nn.BatchNorm1d(out_c),
+            )
+
+    def forward(self, x):
+        identity = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.down is not None:
+            identity = self.down(x)
+        return F.relu(out + identity)
+
+class ResNet1D_Ordinal(nn.Module):
+    def __init__(self, num_classes, in_channels=2):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, 64, 15, 2, 7, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(3, 2, 1),
+        )
+        self.layer1 = BasicBlock(64, 64)
+        self.layer2 = BasicBlock(64, 128, stride=2)
+        self.layer3 = BasicBlock(128, 256, stride=2)
+        self.layer4 = BasicBlock(256, 512, stride=2)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(512, num_classes - 1)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.pool(x).squeeze(-1)
+        return self.fc(x)
+
+def multiclass_brier_score(y_true, y_prob, n_classes):
+    y_onehot = np.eye(n_classes)[y_true]
+    return np.mean(np.sum((y_prob - y_onehot) ** 2, axis=1))
+
+def within_one_accuracy(y_true, y_pred):
+    return np.mean(np.abs(y_true - y_pred) <= 1)
+
+def mean_absolute_class_error(y_true, y_pred):
+    return np.mean(np.abs(y_true - y_pred))
+
+def expected_calibration_error_multiclass(y_true, y_prob, n_bins=15):
+    confidences = y_prob.max(axis=1)
+    predictions = y_prob.argmax(axis=1)
+    accuracies = (predictions == y_true).astype(float)
+
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        left = bin_edges[i]
+        right = bin_edges[i + 1]
+        mask = (confidences > left) & (confidences <= right) if i > 0 else (confidences >= left) & (confidences <= right)
+        if mask.sum() > 0:
+            bin_acc = accuracies[mask].mean()
+            bin_conf = confidences[mask].mean()
+            ece += np.abs(bin_acc - bin_conf) * mask.mean()
+    return ece
+
+def macro_auc_ovr(y_true, y_prob):
+    y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+    try:
+        return roc_auc_score(y_true_bin, y_prob, average="macro", multi_class="ovr")
+    except Exception:
+        return np.nan
+
+def compute_overall_metrics(y_true, y_pred, y_prob):
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "macro_f1": f1_score(y_true, y_pred, average="macro"),
+        "weighted_f1": f1_score(y_true, y_pred, average="weighted"),
+        "macro_auc": macro_auc_ovr(y_true, y_prob),
+        "mae": mean_absolute_class_error(y_true, y_pred),
+        "within_1_class_accuracy": within_one_accuracy(y_true, y_pred),
+        "qwk": cohen_kappa_score(
+            y_true, y_pred, weights="quadratic", labels=list(range(num_classes))
+        ),
+        "multiclass_brier_score": multiclass_brier_score(y_true, y_prob, num_classes),
+        "ece": expected_calibration_error_multiclass(y_true, y_prob, n_bins=15),
+    }
+
+def bootstrap_cis(y_true, y_pred, y_prob, n_boot=1000, seed=21):
+    rng = np.random.default_rng(seed)
+    n = len(y_true)
+
+    metric_keys = list(compute_overall_metrics(y_true, y_pred, y_prob).keys())
+    metric_store = {k: [] for k in metric_keys}
+
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        yt = y_true[idx]
+        yp = y_pred[idx]
+        yp_prob = y_prob[idx]
+        try:
+            m = compute_overall_metrics(yt, yp, yp_prob)
+            for k, v in m.items():
+                metric_store[k].append(v)
+        except Exception:
+            continue
+
+    point = compute_overall_metrics(y_true, y_pred, y_prob)
+    rows = []
+    for k in metric_keys:
+        arr = np.array(metric_store[k], dtype=float)
+        rows.append({
+            "metric": k,
+            "estimate": point[k],
+            "ci_lower": np.percentile(arr, 2.5),
+            "ci_upper": np.percentile(arr, 97.5),
+        })
+    return pd.DataFrame(rows)
+
+def bootstrap_per_class_cis(y_true, y_pred, y_prob, n_boot=1000, seed=21):
+    rng = np.random.default_rng(seed)
+    y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+
+    point_prec, point_rec, point_f1, point_sup = precision_recall_fscore_support(
+        y_true, y_pred, labels=list(range(num_classes)), zero_division=0
+    )
+
+    point_auc = []
+    for i in range(num_classes):
+        try:
+            point_auc.append(roc_auc_score(y_true_bin[:, i], y_prob[:, i]))
+        except Exception:
+            point_auc.append(np.nan)
+
+    store = {cls: {"precision": [], "recall": [], "f1": [], "auroc_ovr": []} for cls in ORDERED_CLASSES}
+    n = len(y_true)
+
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        yt = y_true[idx]
+        yp = y_pred[idx]
+        yp_prob = y_prob[idx]
+        yt_bin = label_binarize(yt, classes=list(range(num_classes)))
+
+        try:
+            prec, rec, f1, _ = precision_recall_fscore_support(
+                yt, yp, labels=list(range(num_classes)), zero_division=0
+            )
+            for i, cls in enumerate(ORDERED_CLASSES):
+                store[cls]["precision"].append(prec[i])
+                store[cls]["recall"].append(rec[i])
+                store[cls]["f1"].append(f1[i])
+                try:
+                    store[cls]["auroc_ovr"].append(roc_auc_score(yt_bin[:, i], yp_prob[:, i]))
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+    rows = []
+    for i, cls in enumerate(ORDERED_CLASSES):
+        rows.append({
+            "class": cls,
+            "precision": point_prec[i],
+            "precision_ci_lower": np.percentile(store[cls]["precision"], 2.5) if len(store[cls]["precision"]) else np.nan,
+            "precision_ci_upper": np.percentile(store[cls]["precision"], 97.5) if len(store[cls]["precision"]) else np.nan,
+            "recall": point_rec[i],
+            "recall_ci_lower": np.percentile(store[cls]["recall"], 2.5) if len(store[cls]["recall"]) else np.nan,
+            "recall_ci_upper": np.percentile(store[cls]["recall"], 97.5) if len(store[cls]["recall"]) else np.nan,
+            "f1": point_f1[i],
+            "f1_ci_lower": np.percentile(store[cls]["f1"], 2.5) if len(store[cls]["f1"]) else np.nan,
+            "f1_ci_upper": np.percentile(store[cls]["f1"], 97.5) if len(store[cls]["f1"]) else np.nan,
+            "support": point_sup[i],
+            "auroc_ovr": point_auc[i],
+            "auroc_ci_lower": np.percentile(store[cls]["auroc_ovr"], 2.5) if len(store[cls]["auroc_ovr"]) else np.nan,
+            "auroc_ci_upper": np.percentile(store[cls]["auroc_ovr"], 97.5) if len(store[cls]["auroc_ovr"]) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+def evaluate_model(model, loader, threshold=0.5):
+    model.eval()
+    preds, trues, class_probs_list, threshold_probs_list = [], [], [], []
+
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            logits = model(x)
+            yhat, threshold_probs_np, class_probs_np = ordinal_logits_to_preds_and_probs(
+                logits, threshold=threshold
+            )
+            preds.append(yhat.cpu().numpy())
+            trues.append(y.cpu().numpy())
+            class_probs_list.append(class_probs_np)
+            threshold_probs_list.append(threshold_probs_np)
+
+    preds = np.concatenate(preds)
+    trues = np.concatenate(trues)
+    class_probs = np.concatenate(class_probs_list, axis=0)
+    threshold_probs = np.concatenate(threshold_probs_list, axis=0)
+
+    acc = accuracy_score(trues, preds)
+    mae = mean_absolute_class_error(trues, preds)
+    return acc, mae, trues, preds, class_probs, threshold_probs
+
+def train_one_seed(seed, select_leads=None, condition_name="ResNet1D_I_aVF_ordinal"):
+    set_seed(seed)
+
+    train_dataset = PTBXLDataset(train_df, expected_len=EXPECTED_LEN, select_leads=select_leads)
+    val_dataset   = PTBXLDataset(val_df,   expected_len=EXPECTED_LEN, select_leads=select_leads)
+    test_dataset  = PTBXLDataset(test_df,  expected_len=EXPECTED_LEN, select_leads=select_leads)
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
+    val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    test_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    model = ResNet1D_Ordinal(num_classes=num_classes, in_channels=len(select_leads)).to(device)
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    best_acc = -np.inf
+    best_state = None
+    history = []
+
+    for epoch in range(EPOCHS):
+        model.train()
+        running_loss = 0.0
+        n_seen = 0
+
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad(set_to_none=True)
+
+            logits = model(x)
+            y_ord = ordinal_encode(y, num_classes)
+            loss = criterion(logits, y_ord)
+
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * x.size(0)
+            n_seen += x.size(0)
+
+        train_loss = running_loss / max(n_seen, 1)
+        val_acc, val_mae, _, _, _, _ = evaluate_model(model, val_loader, threshold=0.5)
+
+        history.append({
+            "seed": seed,
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_accuracy": val_acc,
+            "val_mae_bins": val_mae
+        })
+
+        print(f"[seed {seed}] Epoch {epoch+1:02d} | Train Loss: {train_loss:.4f} | Val Acc: {val_acc:.4f} | Val MAE: {val_mae:.4f}")
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_state = copy.deepcopy(model.state_dict())
+
+    model.load_state_dict(best_state)
+
+    test_acc, test_mae, y_true, y_pred, y_prob, y_thresh_prob = evaluate_model(model, test_loader, threshold=0.5)
+
+    print(f"\n[seed {seed}] TEST ACC: {test_acc:.4f}")
+    print(f"[seed {seed}] TEST MAE: {test_mae:.4f}")
+    print(classification_report(y_true, y_pred, target_names=ORDERED_CLASSES, digits=4))
+
+    return {
+        "seed": seed,
+        "condition_name": condition_name,
+        "select_leads": select_leads,
+        "model": model,
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+        "test_dataset": test_dataset,
+        "history": pd.DataFrame(history),
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "y_prob": y_prob,
+        "y_thresh_prob": y_thresh_prob,
+    }
+
+CONDITIONS = [
+    {"condition_name": "ResNet1D_I_aVF_ordinal", "select_leads": SELECT_LEADS}
+]
+
+all_condition_results = {}
+
+for cond in CONDITIONS:
+    cond_name = cond["condition_name"]
+    cond_results = []
+    for seed in SEEDS:
+        res = train_one_seed(seed=seed, select_leads=cond["select_leads"], condition_name=cond_name)
+        cond_results.append(res)
+    all_condition_results[cond_name] = cond_results
+
+PRIMARY_CONDITION = CONDITIONS[0]["condition_name"]
+primary_runs = all_condition_results[PRIMARY_CONDITION]
+primary_run = primary_runs[0]
+
+model = primary_run["model"]
+test_dataset = primary_run["test_dataset"]
+y_true = primary_run["y_true"]
+y_pred = primary_run["y_pred"]
+y_prob = primary_run["y_prob"]
+y_thresh_prob = primary_run["y_thresh_prob"]
+
+def split_class_counts(frame, split_name):
+    vc = frame["heart_axis"].value_counts().reindex(ORDERED_CLASSES, fill_value=0)
+    return pd.DataFrame({
+        "split": split_name,
+        "class": vc.index,
+        "n": vc.values,
+        "pct_within_split": (100 * vc.values / vc.values.sum()).round(2)
+    })
+
+table1_counts = pd.concat([
+    split_class_counts(train_df, "train"),
+    split_class_counts(val_df, "validation"),
+    split_class_counts(test_df, "test"),
+    split_class_counts(df, "overall"),
+], ignore_index=True)
+
+summary_rows = []
+for split_name, frame in [("train", train_df), ("validation", val_df), ("test", test_df), ("overall", df)]:
+    row = {
+        "split": split_name,
+        "n_ecgs": len(frame),
+        "n_unique_patients": frame["patient_id"].nunique() if "patient_id" in frame.columns else np.nan,
+    }
+    if "age" in frame.columns:
+        row["age_mean"] = round(frame["age"].mean(), 2)
+        row["age_sd"] = round(frame["age"].std(), 2)
+        row["age_median"] = round(frame["age"].median(), 2)
+        row["age_iqr_low"] = round(frame["age"].quantile(0.25), 2)
+        row["age_iqr_high"] = round(frame["age"].quantile(0.75), 2)
+    if "sex" in frame.columns:
+        row["female_n"] = int((frame["sex"] == 0).sum())
+        row["male_n"] = int((frame["sex"] == 1).sum())
+    summary_rows.append(row)
+
+table1_summary = pd.DataFrame(summary_rows)
+
+table1_counts.to_csv(os.path.join(TAB_DIR, "table1_dataset_class_distribution.csv"), index=False)
+table1_summary.to_csv(os.path.join(TAB_DIR, "table1_dataset_summary.csv"), index=False)
+
+print("\nSaved:", os.path.join(TAB_DIR, "table1_dataset_class_distribution.csv"))
+print("Saved:", os.path.join(TAB_DIR, "table1_dataset_summary.csv"))
+display(table1_summary)
+display(table1_counts)
+
+primary_ci = bootstrap_cis(y_true, y_pred, y_prob, n_boot=N_BOOT, seed=PRIMARY_SEED)
+
+seed_metric_rows = []
+for run in primary_runs:
+    metrics = compute_overall_metrics(run["y_true"], run["y_pred"], run["y_prob"])
+    row = {"seed": run["seed"], "condition_name": PRIMARY_CONDITION}
+    row.update(metrics)
+    seed_metric_rows.append(row)
+
+seed_metrics_df = pd.DataFrame(seed_metric_rows)
+
+summary_rows = []
+for metric in ["accuracy", "macro_f1", "macro_auc", "mae", "qwk", "balanced_accuracy", "within_1_class_accuracy", "ece"]:
+    vals = seed_metrics_df[metric].values
+    summary_rows.append({
+        "Model": "ResNet1D",
+        "Leads": "I + aVF",
+        "Formulation": "Ordinal",
+        "metric": metric,
+        "primary_seed_estimate": float(primary_ci.loc[primary_ci["metric"] == metric, "estimate"].iloc[0]),
+        "primary_seed_ci_lower": float(primary_ci.loc[primary_ci["metric"] == metric, "ci_lower"].iloc[0]),
+        "primary_seed_ci_upper": float(primary_ci.loc[primary_ci["metric"] == metric, "ci_upper"].iloc[0]),
+        "mean_across_seeds": vals.mean(),
+        "sd_across_seeds": vals.std(ddof=1) if len(vals) > 1 else 0.0,
+    })
+
+table3_long = pd.DataFrame(summary_rows)
+
+table3_wide = pd.DataFrame([{
+    "Model": "ResNet1D",
+    "Leads": "I + aVF",
+    "Formulation": "Ordinal",
+    "Accuracy": f"{table3_long.loc[table3_long.metric=='accuracy','primary_seed_estimate'].iloc[0]:.4f} "
+                f"({table3_long.loc[table3_long.metric=='accuracy','primary_seed_ci_lower'].iloc[0]:.4f}-"
+                f"{table3_long.loc[table3_long.metric=='accuracy','primary_seed_ci_upper'].iloc[0]:.4f})",
+    "Macro F1": f"{table3_long.loc[table3_long.metric=='macro_f1','primary_seed_estimate'].iloc[0]:.4f} "
+                f"({table3_long.loc[table3_long.metric=='macro_f1','primary_seed_ci_lower'].iloc[0]:.4f}-"
+                f"{table3_long.loc[table3_long.metric=='macro_f1','primary_seed_ci_upper'].iloc[0]:.4f})",
+    "Macro AUC": f"{table3_long.loc[table3_long.metric=='macro_auc','primary_seed_estimate'].iloc[0]:.4f} "
+                 f"({table3_long.loc[table3_long.metric=='macro_auc','primary_seed_ci_lower'].iloc[0]:.4f}-"
+                 f"{table3_long.loc[table3_long.metric=='macro_auc','primary_seed_ci_upper'].iloc[0]:.4f})",
+    "MAE": f"{table3_long.loc[table3_long.metric=='mae','primary_seed_estimate'].iloc[0]:.4f} "
+           f"({table3_long.loc[table3_long.metric=='mae','primary_seed_ci_lower'].iloc[0]:.4f}-"
+           f"{table3_long.loc[table3_long.metric=='mae','primary_seed_ci_upper'].iloc[0]:.4f})",
+    "QWK": f"{table3_long.loc[table3_long.metric=='qwk','primary_seed_estimate'].iloc[0]:.4f} "
+           f"({table3_long.loc[table3_long.metric=='qwk','primary_seed_ci_lower'].iloc[0]:.4f}-"
+           f"{table3_long.loc[table3_long.metric=='qwk','primary_seed_ci_upper'].iloc[0]:.4f})",
+    "Accuracy_mean±SD_across_seeds": f"{seed_metrics_df['accuracy'].mean():.4f} ± {seed_metrics_df['accuracy'].std(ddof=1):.4f}" if len(seed_metrics_df)>1 else f"{seed_metrics_df['accuracy'].mean():.4f}",
+    "MacroF1_mean±SD_across_seeds": f"{seed_metrics_df['macro_f1'].mean():.4f} ± {seed_metrics_df['macro_f1'].std(ddof=1):.4f}" if len(seed_metrics_df)>1 else f"{seed_metrics_df['macro_f1'].mean():.4f}",
+}])
+
+table3_long.to_csv(os.path.join(TAB_DIR, "table3_primary_results_long.csv"), index=False)
+table3_wide.to_csv(os.path.join(TAB_DIR, "table3_primary_results_wide.csv"), index=False)
+seed_metrics_df.to_csv(os.path.join(SUPP_TAB_DIR, "supplement_seed_level_primary_metrics.csv"), index=False)
+
+print("Saved:", os.path.join(TAB_DIR, "table3_primary_results_long.csv"))
+print("Saved:", os.path.join(TAB_DIR, "table3_primary_results_wide.csv"))
+display(table3_wide)
+display(table3_long)
+
+table4 = bootstrap_per_class_cis(y_true, y_pred, y_prob, n_boot=N_BOOT, seed=PRIMARY_SEED)
+table4.to_csv(os.path.join(TAB_DIR, "table4_per_class_performance.csv"), index=False)
+print("Saved:", os.path.join(TAB_DIR, "table4_per_class_performance.csv"))
+display(table4)
+
+fig, ax = plt.subplots(figsize=(14, 6))
+ax.axis("off")
+
+boxes = [
+    (0.04, 0.60, 0.18, 0.24, f"PTB-XL metadata\nn={len(pd.read_csv(DB_CSV)):,} rows"),
+    (0.28, 0.60, 0.22, 0.24, "Filter:\nheart_axis not null\nfilename_lr present\nremove AXR/AXL/SAG\n100 Hz files exist"),
+    (0.56, 0.60, 0.18, 0.24, "Axis ordering:\nALAD < LAD < MID < RAD < ARAD"),
+    (0.79, 0.60, 0.17, 0.24, f"Final cohort\nn={len(df):,} ECGs"),
+    (0.17, 0.18, 0.18, 0.24, f"Train\nn={len(train_df):,}"),
+    (0.41, 0.18, 0.18, 0.24, f"Validation\nn={len(val_df):,}"),
+    (0.65, 0.18, 0.18, 0.24, f"Test\nn={len(test_df):,}"),
+]
+
+for (x, y, w, h, text) in boxes:
+    rect = plt.Rectangle((x, y), w, h, fill=False, linewidth=2, transform=ax.transAxes)
+    ax.add_patch(rect)
+    ax.text(x + w/2, y + h/2, text, ha="center", va="center", fontsize=11, transform=ax.transAxes)
+
+arrowprops = dict(arrowstyle="->", lw=2)
+ax.annotate("", xy=(0.28, 0.72), xytext=(0.22, 0.72), xycoords="axes fraction", arrowprops=arrowprops)
+ax.annotate("", xy=(0.56, 0.72), xytext=(0.50, 0.72), xycoords="axes fraction", arrowprops=arrowprops)
+ax.annotate("", xy=(0.79, 0.72), xytext=(0.74, 0.72), xycoords="axes fraction", arrowprops=arrowprops)
+ax.annotate("", xy=(0.26, 0.42), xytext=(0.87, 0.60), xycoords="axes fraction", arrowprops=arrowprops)
+ax.annotate("", xy=(0.50, 0.42), xytext=(0.87, 0.60), xycoords="axes fraction", arrowprops=arrowprops)
+ax.annotate("", xy=(0.74, 0.42), xytext=(0.87, 0.60), xycoords="axes fraction", arrowprops=arrowprops)
+
+plt.tight_layout()
+fig1_path = os.path.join(FIG_DIR, "figure1_dataset_label_pipeline.png")
+plt.savefig(fig1_path, dpi=300, bbox_inches="tight")
+plt.show()
+print("Saved:", fig1_path)
+
+fig, ax = plt.subplots(figsize=(14, 4))
+ax.axis("off")
+
+arch_boxes = [
+    (0.03, 0.30, 0.13, 0.40, "Input ECG\n2 × 1000"),
+    (0.20, 0.30, 0.15, 0.40, "Stem\nConv-BN-ReLU-MaxPool"),
+    (0.40, 0.30, 0.20, 0.40, "Residual Blocks\n64 → 128 → 256 → 512"),
+    (0.65, 0.30, 0.12, 0.40, "Global Avg Pool"),
+    (0.82, 0.30, 0.13, 0.40, "Ordinal Head\n4 thresholds"),
+]
+
+for (x, y, w, h, text) in arch_boxes:
+    rect = plt.Rectangle((x, y), w, h, fill=False, linewidth=2, transform=ax.transAxes)
+    ax.add_patch(rect)
+    ax.text(x + w/2, y + h/2, text, ha="center", va="center", fontsize=11, transform=ax.transAxes)
+
+for x1, x2 in [(0.16, 0.20), (0.35, 0.40), (0.60, 0.65), (0.77, 0.82)]:
+    ax.annotate("", xy=(x2, 0.50), xytext=(x1, 0.50), xycoords="axes fraction",
+                arrowprops=dict(arrowstyle="->", lw=2))
+
+ax.text(0.5, 0.05,
+        "Ordinal CORAL-style formulation using leads I and aVF only.",
+        ha="center", va="bottom", fontsize=10, transform=ax.transAxes)
+
+plt.tight_layout()
+fig2_path = os.path.join(FIG_DIR, "figure2_model_architecture.png")
+plt.savefig(fig2_path, dpi=300, bbox_inches="tight")
+plt.show()
+print("Saved:", fig2_path)
+
+cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
+cm_norm = cm.astype(float) / np.maximum(cm.sum(axis=1, keepdims=True), 1)
+
+fig, ax = plt.subplots(figsize=(7, 6))
+im = ax.imshow(cm_norm, aspect="auto", vmin=0, vmax=1)
+ax.set_title("Normalized confusion matrix")
+ax.set_xticks(range(num_classes))
+ax.set_yticks(range(num_classes))
+ax.set_xticklabels(ORDERED_CLASSES, rotation=45, ha="right")
+ax.set_yticklabels(ORDERED_CLASSES)
+ax.set_xlabel("Predicted")
+ax.set_ylabel("True")
+for i in range(num_classes):
+    for j in range(num_classes):
+        ax.text(j, i, f"{cm_norm[i, j]:.2f}", ha="center", va="center", fontsize=10)
+plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+plt.tight_layout()
+fig3_path = os.path.join(FIG_DIR, "figure3_confusion_matrix.png")
+plt.savefig(fig3_path, dpi=300, bbox_inches="tight")
+plt.show()
+print("Saved:", fig3_path)
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.bar(table4["class"], table4["recall"].values)
+ax.set_ylim(0, 1)
+ax.set_ylabel("Recall")
+ax.set_title("Per-class recall")
+plt.tight_layout()
+fig4_path = os.path.join(FIG_DIR, "figure4_per_class_recall.png")
+plt.savefig(fig4_path, dpi=300, bbox_inches="tight")
+plt.show()
+print("Saved:", fig4_path)
+
+y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+
+fig, axes = plt.subplots(2, math.ceil(num_classes / 2), figsize=(16, 8))
+axes = np.array(axes).reshape(-1)
+
+for i in range(num_classes):
+    ax = axes[i]
+    fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_prob[:, i])
+    roc_auc = auc(fpr, tpr)
+    ax.plot(fpr, tpr, label=f"AUC={roc_auc:.3f}")
+    ax.plot([0, 1], [0, 1], linestyle="--")
+    ax.set_title(f"{ORDERED_CLASSES[i]} vs rest")
+    ax.set_xlabel("False positive rate")
+    ax.set_ylabel("True positive rate")
+    ax.legend()
+
+for j in range(num_classes, len(axes)):
+    axes[j].axis("off")
+
+plt.tight_layout()
+fig5_path = os.path.join(FIG_DIR, "figure5_roc_curves.png")
+plt.savefig(fig5_path, dpi=300, bbox_inches="tight")
+plt.show()
+print("Saved:", fig5_path)
+
+overall_counts = df["heart_axis"].value_counts().reindex(ORDERED_CLASSES, fill_value=0)
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.bar(overall_counts.index, overall_counts.values)
+ax.set_ylabel("Sample count")
+ax.set_title("Class distribution")
+plt.tight_layout()
+fig6_path = os.path.join(FIG_DIR, "figure6_class_distribution.png")
+plt.savefig(fig6_path, dpi=300, bbox_inches="tight")
+plt.show()
+print("Saved:", fig6_path)
+
+history_df = pd.concat([run["history"] for run in primary_runs], ignore_index=True)
+history_df.to_csv(os.path.join(SUPP_TAB_DIR, "supplement_training_history_all_seeds.csv"), index=False)
+
+hist_summary = history_df.groupby("epoch").agg(
+    train_loss_mean=("train_loss", "mean"),
+    train_loss_sd=("train_loss", "std"),
+    val_accuracy_mean=("val_accuracy", "mean"),
+    val_accuracy_sd=("val_accuracy", "std"),
+    val_mae_mean=("val_mae_bins", "mean"),
+    val_mae_sd=("val_mae_bins", "std"),
+).reset_index()
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.plot(hist_summary["epoch"], hist_summary["train_loss_mean"], label="Train loss")
+ax2 = ax.twinx()
+ax2.plot(hist_summary["epoch"], hist_summary["val_accuracy_mean"], label="Val accuracy")
+ax.set_xlabel("Epoch")
+ax.set_ylabel("Train loss")
+ax2.set_ylabel("Validation accuracy")
+ax.set_title("Learning curves")
+ax.legend(loc="upper left")
+ax2.legend(loc="upper right")
+plt.tight_layout()
+learning_curve_path = os.path.join(SUPP_FIG_DIR, "supplement_learning_curves.png")
+plt.savefig(learning_curve_path, dpi=300, bbox_inches="tight")
+plt.show()
+print("Saved:", learning_curve_path)
+
+confidences = y_prob.max(axis=1)
+predictions = y_prob.argmax(axis=1)
+correct = (predictions == y_true).astype(int)
+
+bin_edges = np.linspace(0, 1, 11)
+bin_centers, accs, confs = [], [], []
+for i in range(len(bin_edges) - 1):
+    lo, hi = bin_edges[i], bin_edges[i + 1]
+    mask = (confidences >= lo) & (confidences < hi) if i < len(bin_edges)-2 else (confidences >= lo) & (confidences <= hi)
+    if mask.sum() > 0:
+        bin_centers.append((lo + hi) / 2)
+        accs.append(correct[mask].mean())
+        confs.append(confidences[mask].mean())
+
+ece_val = expected_calibration_error_multiclass(y_true, y_prob, n_bins=15)
+
+calib_df = pd.DataFrame({
+    "bin_center": bin_centers,
+    "accuracy": accs,
+    "mean_confidence": confs
+})
+calib_df["ece"] = ece_val
+calib_df.to_csv(os.path.join(SUPP_TAB_DIR, "supplement_calibration_curve.csv"), index=False)
+
+fig, ax = plt.subplots(figsize=(6, 6))
+ax.plot([0, 1], [0, 1], linestyle="--", label="Perfect calibration")
+ax.plot(confs, accs, marker="o", label=f"Model (ECE={ece_val:.4f})")
+ax.set_xlabel("Mean predicted confidence")
+ax.set_ylabel("Observed accuracy")
+ax.set_title("Reliability diagram")
+ax.legend()
+plt.tight_layout()
+calib_path = os.path.join(SUPP_FIG_DIR, "supplement_reliability_diagram.png")
+plt.savefig(calib_path, dpi=300, bbox_inches="tight")
+plt.show()
+print("Saved:", calib_path)
+
+abs_err = np.abs(y_true - y_pred)
+err_counts = pd.Series(abs_err).value_counts().reindex(range(num_classes), fill_value=0)
+err_props = err_counts / err_counts.sum()
+
+ordinal_error_df = pd.DataFrame({
+    "absolute_class_error": list(range(num_classes)),
+    "count": err_counts.values,
+    "proportion": err_props.values
+})
+ordinal_error_df.to_csv(os.path.join(SUPP_TAB_DIR, "supplement_ordinal_error_distribution.csv"), index=False)
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.bar(ordinal_error_df["absolute_class_error"].astype(str), ordinal_error_df["proportion"])
+ax.set_xlabel("Absolute class error")
+ax.set_ylabel("Proportion")
+ax.set_title("Ordinal error distribution")
+plt.tight_layout()
+ordinal_err_path = os.path.join(SUPP_FIG_DIR, "supplement_ordinal_error_distribution.png")
+plt.savefig(ordinal_err_path, dpi=300, bbox_inches="tight")
+plt.show()
+print("Saved:", ordinal_err_path)
+
+mcnemar_rows = []
+if len(CONDITIONS) >= 2:
+    for cond_a, cond_b in itertools.combinations(CONDITIONS, 2):
+        a_name = cond_a["condition_name"]
+        b_name = cond_b["condition_name"]
+
+        a_run = all_condition_results[a_name][0]
+        b_run = all_condition_results[b_name][0]
+
+        a_correct = (a_run["y_pred"] == a_run["y_true"])
+        b_correct = (b_run["y_pred"] == b_run["y_true"])
+
+        table = np.array([
+            [np.sum((a_correct == 1) & (b_correct == 1)), np.sum((a_correct == 1) & (b_correct == 0))],
+            [np.sum((a_correct == 0) & (b_correct == 1)), np.sum((a_correct == 0) & (b_correct == 0))]
+        ])
+
+        try:
+            result = mcnemar(table, exact=False, correction=True)
+            mcnemar_rows.append({
+                "condition_a": a_name,
+                "condition_b": b_name,
+                "b_only_correct": int(table[1, 0]),
+                "a_only_correct": int(table[0, 1]),
+                "statistic": float(result.statistic),
+                "p_value": float(result.pvalue),
+            })
+        except Exception:
+            pass
+
+if len(mcnemar_rows) > 0:
+    mcnemar_df = pd.DataFrame(mcnemar_rows)
+    mcnemar_df.to_csv(os.path.join(SUPP_TAB_DIR, "supplement_mcnemar_pairwise.csv"), index=False)
+    print("Saved:", os.path.join(SUPP_TAB_DIR, "supplement_mcnemar_pairwise.csv"))
+    display(mcnemar_df)
+
+def compute_saliency(model_for_saliency, sig_np, target_class=None):
+    model_for_saliency.eval()
+
+    x = torch.tensor(sig_np[None, :, :], dtype=torch.float32, device=device, requires_grad=True)
+    logits = model_for_saliency(x)
+    threshold_probs = torch.sigmoid(logits)
+    pred_class = int(torch.sum(threshold_probs > 0.5, dim=1).item())
+
+    if target_class is None:
+        target_class = pred_class
+
+    if target_class == 0:
+        score = 1.0 - threshold_probs[0, 0]
+    elif target_class == num_classes - 1:
+        score = threshold_probs[0, -1]
+    else:
+        score = threshold_probs[0, target_class - 1] - threshold_probs[0, target_class]
+
+    model_for_saliency.zero_grad()
+    score.backward()
+
+    sal = x.grad.detach().abs().cpu().numpy()[0]
+    sal = sal / (sal.max() + 1e-8)
+    return sal, pred_class
+
+def pick_representative_correct_example(frame_with_preds, preferred_class=None):
+    frame = frame_with_preds.copy()
+
+    if preferred_class is not None:
+        cand = frame[(frame["correct"]) & (frame["y_true"] == preferred_class)].copy()
+    else:
+        cand = frame[frame["correct"]].copy()
+
+    if len(cand) == 0:
+        cand = frame.copy()
+
+    cand = cand.sort_values("max_prob", ascending=False)
+    return cand.iloc[0]
+
+def plot_saliency_figure(row, save_path, model_for_saliency):
+    sig = load_and_normalize_signal(
+        row["record_path"],
+        expected_len=1000,
+        select_leads=SELECT_LEADS
+    )
+    sal, pred_class = compute_saliency(model_for_saliency, sig, target_class=int(row["y_true"]))
+
+    top_leads = np.argsort(sal.mean(axis=1))[::-1][:len(DISPLAY_LEAD_NAMES)]
+
+    fig = plt.figure(figsize=(12, 8))
+    gs = fig.add_gridspec(3, 1, height_ratios=[1.5, 1, 1])
+
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax0.imshow(sal, aspect="auto", origin="lower")
+    ax0.set_yticks(range(len(DISPLAY_LEAD_NAMES)))
+    ax0.set_yticklabels(DISPLAY_LEAD_NAMES)
+    ax0.set_xlabel("Time samples (100 Hz)")
+    ax0.set_title(
+        f"Saliency heatmap | True={idx_to_class[int(row['y_true'])]} | Pred={idx_to_class[pred_class]}"
+    )
+
+    t = np.arange(sig.shape[1]) / 100.0
+    for plot_idx, lead_idx in enumerate(top_leads, start=1):
+        ax = fig.add_subplot(gs[plot_idx, 0])
+        ax.plot(t, sig[lead_idx], linewidth=1.0)
+        overlay = sal[lead_idx]
+        scaled_overlay = (overlay / (overlay.max() + 1e-8)) * (sig[lead_idx].max() - sig[lead_idx].min()) * 0.3
+        ax.fill_between(t, sig[lead_idx].min(), sig[lead_idx].min() + scaled_overlay, alpha=0.35)
+        ax.set_title(f"Lead {DISPLAY_LEAD_NAMES[lead_idx]} (mean saliency={sal[lead_idx].mean():.3f})")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("z-score")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+test_meta = test_dataset.frame.copy()
+test_meta["y_true"] = y_true
+test_meta["y_pred"] = y_pred
+test_meta["max_prob"] = y_prob.max(axis=1)
+test_meta["correct"] = (test_meta["y_true"] == test_meta["y_pred"])
+
+rep_row = pick_representative_correct_example(test_meta, preferred_class=class_to_idx["MID"])
+fig_saliency_path = os.path.join(SUPP_FIG_DIR, "supplement_representative_saliency.png")
+plot_saliency_figure(rep_row, fig_saliency_path, model_for_saliency=model)
+print("Saved:", fig_saliency_path)
+
+for cls_name in ORDERED_CLASSES:
+    cls_idx = class_to_idx[cls_name]
+    try:
+        row = pick_representative_correct_example(test_meta, preferred_class=cls_idx)
+        save_path = os.path.join(SUPP_FIG_DIR, f"supplement_saliency_{cls_name}.png")
+        plot_saliency_figure(row, save_path, model_for_saliency=model)
+        print("Saved:", save_path)
+    except Exception as e:
+        print(f"Skipping saliency example for {cls_name}: {e}")
+
+
+sens_rows = []
+
+def add_perf_row(name, yt, yp):
+    if len(yt) == 0:
+        return
+    sens_rows.append({
+        "analysis": name,
+        "n": len(yt),
+        "accuracy": accuracy_score(yt, yp),
+        "balanced_accuracy": balanced_accuracy_score(yt, yp),
+        "macro_f1": f1_score(yt, yp, average="macro"),
+        "within_1_class_accuracy": within_one_accuracy(yt, yp),
+        "mean_absolute_class_error": mean_absolute_class_error(yt, yp),
+    })
+
+if "sex" in test_meta.columns:
+    female = test_meta[test_meta["sex"] == 0]
+    male   = test_meta[test_meta["sex"] == 1]
+    add_perf_row("sex_female", female["y_true"].values, female["y_pred"].values)
+    add_perf_row("sex_male", male["y_true"].values, male["y_pred"].values)
+
+if "age" in test_meta.columns:
+    med_age = test_meta["age"].median()
+    younger = test_meta[test_meta["age"] <= med_age]
+    older   = test_meta[test_meta["age"] > med_age]
+    add_perf_row(f"age_le_median_{med_age}", younger["y_true"].values, younger["y_pred"].values)
+    add_perf_row(f"age_gt_median_{med_age}", older["y_true"].values, older["y_pred"].values)
+
+for thr in [0.40, 0.50, 0.60, 0.70]:
+    sub = test_meta[test_meta["max_prob"] >= thr]
+    add_perf_row(f"confidence_ge_{thr:.2f}", sub["y_true"].values, sub["y_pred"].values)
+
+sens_df = pd.DataFrame(sens_rows)
+sens_df.to_csv(os.path.join(SUPP_TAB_DIR, "supplement_sensitivity_analyses.csv"), index=False)
+print("Saved:", os.path.join(SUPP_TAB_DIR, "supplement_sensitivity_analyses.csv"))
+display(sens_df)
+
+
+def count_parameters(m):
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+hyperparams = {
+    "seeds": SEEDS,
+    "device": str(device),
+    "sampling_rate_hz": 100,
+    "signal_length_samples": EXPECTED_LEN,
+    "signal_duration_seconds": 10,
+    "batch_size": BATCH_SIZE,
+    "epochs": EPOCHS,
+    "optimizer": "AdamW",
+    "learning_rate": 3e-4,
+    "loss": "BCEWithLogitsLoss",
+    "architecture": "ResNet1D_Ordinal",
+    "input_leads": SELECT_LEADS,
+    "num_trainable_parameters": int(count_parameters(model)),
+    "ordered_classes": ORDERED_CLASSES,
+    "ordinal_thresholds": num_classes - 1,
+    "train_n": int(len(train_df)),
+    "val_n": int(len(val_df)),
+    "test_n": int(len(test_df)),
+}
+with open(os.path.join(SUPP_TAB_DIR, "supplement_hyperparameters_and_training_details.json"), "w") as f:
+    json.dump(hyperparams, f, indent=2)
+
+print("\n================ MANUSCRIPT OUTPUTS SAVED ================")
+print("MAIN MANUSCRIPT")
+print("Table 1A:", os.path.join(TAB_DIR, "table1_dataset_summary.csv"))
+print("Table 1B:", os.path.join(TAB_DIR, "table1_dataset_class_distribution.csv"))
+print("Table 3A:", os.path.join(TAB_DIR, "table3_primary_results_wide.csv"))
+print("Table 3B:", os.path.join(TAB_DIR, "table3_primary_results_long.csv"))
+print("Table 4 :", os.path.join(TAB_DIR, "table4_per_class_performance.csv"))
+print("Figure 1:", fig1_path)
+print("Figure 2:", fig2_path)
+print("Figure 3:", fig3_path)
+print("Figure 4:", fig4_path)
+print("Figure 5:", fig5_path)
+print("Figure 6:", fig6_path)
+
+print("\nSUPPLEMENT")
+print("Seed-level metrics:", os.path.join(SUPP_TAB_DIR, "supplement_seed_level_primary_metrics.csv"))
+print("Training history:", os.path.join(SUPP_TAB_DIR, "supplement_training_history_all_seeds.csv"))
+print("Learning curves:", learning_curve_path)
+print("Reliability diagram:", calib_path)
+print("Ordinal error:", ordinal_err_path)
+print("Representative saliency:", fig_saliency_path)
+print("Hyperparameters:", os.path.join(SUPP_TAB_DIR, "supplement_hyperparameters_and_training_details.json"))
+print("=========================================================")
